@@ -21,3 +21,5 @@ tests/inspectdb/models.py
 salesforce/packages/
 venv
 tests/x_*/
+
+.idea/*
