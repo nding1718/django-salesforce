@@ -34,6 +34,7 @@ DATABASES = {
 # If running in a Windows environment this must be set to the same as your
 # system time zone.
 TIME_ZONE = 'America/New_York'
+USE_TZ = True
 
 # Language code for this installation. All choices can be found here:
 # http://www.i18nguy.com/unicode/language-identifiers.html
@@ -126,7 +127,6 @@ INSTALLED_APPS = (
     'django.contrib.admindocs',
     'salesforce',
     'salesforce.testrunner.example',
-    'salesforce.testrunner.dynamic_models',
 )
 
 SALESFORCE_DB_ALIAS = 'salesforce'
@@ -184,13 +184,13 @@ LOGGING = {
 # Preventive workaround for some problems with IPv6 by restricting DNS queries
 # in the Python process only to IPv4, until the support by SFDC become stable.
 # SFDC enabled IPv6 for a week in March 2014. It caused long delays somewhere.
-IPV4_ONLY = True
+# IPV4_ONLY = True
 
 # Name of primary key - by default 'id'. The value 'Id' was the default for
 # version "django-salesforce < 0.5".
 # SF_PK = 'Id'
 
 try:
-    from salesforce.testrunner.local_settings import *  # NOQA
+    from salesforce.testrunner.local_settings import *  # NOQA pylint:disable=unused-wildcard-import,wildcard-import
 except ImportError:
     pass

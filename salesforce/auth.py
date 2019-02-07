@@ -21,12 +21,12 @@ import hmac
 import logging
 import threading
 
-from django.db import connections
 import requests
 from requests.adapters import HTTPAdapter
 from requests.auth import AuthBase
-from salesforce.backend import get_max_retries
-from salesforce.backend.driver import DatabaseError, IntegrityError
+
+from salesforce.dbapi import connections, get_max_retries
+from salesforce.dbapi.exceptions import DatabaseError, IntegrityError
 
 # TODO hy: more advanced methods with ouathlib can be implemented, but
 #      the simple doesn't require a special package.
@@ -107,16 +107,15 @@ class SalesforceAuth(AuthBase):
         """
         if self.dynamic:
             return self.dynamic
-        elif self.settings_dict['USER'] == 'dynamic auth':
+        if self.settings_dict['USER'] == 'dynamic auth':
             return {'instance_url': self.settings_dict['HOST']}
-        else:
-            # If another thread is running inside this method, wait for it to
-            # finish. Always release the lock no matter what happens in the block
-            db_alias = self.db_alias
-            with oauth_lock:
-                if db_alias not in oauth_data:
-                    oauth_data[db_alias] = self.authenticate()
-                return oauth_data[db_alias]
+        # If another thread is running inside this method, wait for it to
+        # finish. Always release the lock no matter what happens in the block
+        db_alias = self.db_alias
+        with oauth_lock:
+            if db_alias not in oauth_data:
+                oauth_data[db_alias] = self.authenticate()
+            return oauth_data[db_alias]
 
     def del_token(self):
         with oauth_lock:
@@ -130,14 +129,13 @@ class SalesforceAuth(AuthBase):
         return r
 
     def reauthenticate(self):
-        if self.dynamic is None:
-            self.del_token()
-            return self.get_auth()['access_token']
-        else:
+        if self.dynamic is not None:
             # It is expected that with dynamic authentication we get a token that
             # is valid at least for a few future seconds, because we don't get
             # any password or permanent permission for it from the user.
             raise DatabaseError("Dynamically authenticated connection can never reauthenticate.")
+        self.del_token()
+        return self.get_auth()['access_token']
 
     @property
     def instance_url(self):
@@ -173,27 +171,43 @@ class SalesforcePasswordAuth(SalesforceAuth):
         settings_dict = self.settings_dict
         url = ''.join([settings_dict['HOST'], '/services/oauth2/token'])
 
-        log.info("attempting authentication to %s" % settings_dict['HOST'])
+        log.info("attempting authentication to %s", settings_dict['HOST'])
         self._session.mount(settings_dict['HOST'], HTTPAdapter(max_retries=get_max_retries()))
-        response = self._session.post(url, data=dict(
-            grant_type      = 'password',
-            client_id       = settings_dict['CONSUMER_KEY'],
-            client_secret   = settings_dict['CONSUMER_SECRET'],
-            username        = settings_dict['USER'],
-            password        = settings_dict['PASSWORD'],
-        ))
+        auth_params = {
+            'grant_type':    'password',
+            'client_id':     settings_dict['CONSUMER_KEY'],
+            'client_secret': settings_dict['CONSUMER_SECRET'],
+            'username':      settings_dict['USER'],
+            'password':      settings_dict['PASSWORD'],
+        }
+        response = self._session.post(url, data=auth_params)
         if response.status_code == 200:
             # prefer str in Python 2 due to other API
             response_data = {str(k): str(v) for k, v in response.json().items()}
             # Verify signature (not important for this auth mechanism)
-            calc_signature = (base64.b64encode(hmac.new(
-                    key=settings_dict['CONSUMER_SECRET'].encode('ascii'),
-                    msg=(response_data['id'] + response_data['issued_at']).encode('ascii'),
-                    digestmod=hashlib.sha256).digest())).decode('ascii')
+            calc_signature = (
+                base64.b64encode(
+                    hmac.new(
+                        key=settings_dict['CONSUMER_SECRET'].encode('ascii'),
+                        msg=(response_data['id'] + response_data['issued_at']).encode('ascii'),
+                        digestmod=hashlib.sha256
+                    ).digest()
+                )
+            ).decode('ascii')
             if calc_signature == response_data['signature']:
-                log.info("successfully authenticated %s" % settings_dict['USER'])
+                log.info("successfully authenticated %s", settings_dict['USER'])
             else:
                 raise IntegrityError('Invalid auth signature received')
         else:
             raise LookupError("oauth failed: %s: %s" % (settings_dict['USER'], response.text))
         return response_data
+
+
+class MockAuth(SalesforceAuth):
+    """Dummy authentication for offline Mock tests"""
+    def authenticate(self):
+        return {'instance_url': 'mock://'}
+
+    def get_auth(self):
+        # this is never cached
+        return self.authenticate()

@@ -7,7 +7,6 @@
 
 import os
 import re
-import subprocess
 
 # disables creation of .DS_Store files inside tarballs on Mac OS X
 os.environ['COPY_EXTENDED_ATTRIBUTES_DISABLE'] = 'true'
@@ -55,7 +54,7 @@ def autosetup():
         # setuptools won't auto-detect Git managed files without this
         setup_requires=[] if not with_git else ["setuptools_git >= 0.4.2"],
 
-        install_requires=['django>=1.10,<2.2'] + requirements_txt,
+        install_requires=['django>=1.10'] + requirements_txt,
 
         # metadata for upload to PyPI
         author="Freelancers Union",
@@ -67,6 +66,7 @@ def autosetup():
         keywords="django salesforce orm backend",
         url="https://github.com/django-salesforce/django-salesforce",
     )
+
 
 if __name__ == '__main__':
     dist = autosetup()

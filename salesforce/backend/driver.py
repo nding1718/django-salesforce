@@ -34,7 +34,8 @@ request_count = 0  # global counter
 # Django 1.8, otherwise some exceptions are not correctly reported in it.
 
 
-class Error(Exception if PY3 else StandardError):
+
+class Error(Exception if PY3 else StandardError):  # NOQA: StandardError undefined on PY3
     pass
 
 
@@ -112,6 +113,7 @@ def getaddrinfo_wrapper(host, port, family=socket.AF_INET, socktype=0, proto=0, 
     """Patched 'getaddrinfo' with default family IPv4 (enabled by settings IPV4_ONLY=True)"""
     return orig_getaddrinfo(host, port, family, socktype, proto, flags)
 
+
 # patch to IPv4 if required and not patched by anything other yet
 if getattr(settings, 'IPV4_ONLY', False) and socket.getaddrinfo.__module__ in ('socket', '_socket'):
     log.info("Patched socket to IPv4 only")
@@ -159,7 +161,7 @@ def handle_api_exceptions(url, f, *args, **kwargs):
     # TODO Remove this verbose setting after tuning of specific messages.
     #      Currently it is better more or less.
     # http://www.salesforce.com/us/developer/docs/api_rest/Content/errorcodes.htm
-    verbose = not getattr(getattr(_cursor, 'query', None), 'debug_silent', False)
+    verbose = not getattr(getattr(_cursor, 'db', None), 'debug_silent', False)
     if 'json' not in response.headers.get('Content-Type', ''):
         raise OperationalError("HTTP error code %d: %s" % (response.status_code, response.text))
     else:

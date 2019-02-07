@@ -6,42 +6,29 @@
 #
 
 """
-Generate queries using the SOQL dialect.
+Generate queries using the SOQL dialect.  (like django.db.models.sql.compiler and  django.db.models.sql.where)
 """
 import re
-from django.db import models
-from django.db.models.sql import compiler, query, where, constants, AND, OR
+from django.db.models.sql import compiler as sql_compiler, where as sql_where, constants, AND
 from django.db.models.sql.datastructures import EmptyResultSet
-import django.db.models.aggregates
-from . import subselect
-from salesforce import DJANGO_19_PLUS
-from salesforce.backend.driver import DatabaseError
 from django.db.transaction import TransactionManagementError
-import salesforce
+
+import salesforce.backend.models_lookups   # required for activation of lookups
+from salesforce.dbapi.driver import DatabaseError
+
+# pylint:no-else-return,too-many-branches,too-many-locals
 
 
-class SQLCompiler(compiler.SQLCompiler):
+class SQLCompiler(sql_compiler.SQLCompiler):
     """
     A subclass of the default SQL compiler for the SOQL dialect.
     """
     soql_trans = None
 
-    def get_columns(self, with_aliases=False):
-        """
-        Remove table names and strip quotes from column names.
-        """
-        soql_trans = self.query_topology()
-        cols, col_params = compiler.SQLCompiler.get_columns(self, with_aliases)
-        out = []
-        for col in cols:
-            if soql_trans and re.match(r'^\w+\.\w+$', col):
-                tab_name, col_name = col.split('.')
-                out.append('%s.%s' % (soql_trans[tab_name], col_name))
-            else:
-                out.append(col)
-        cols = out
-        result = [x.replace(' AS ', ' ') for x in cols]
-        return (result, col_params)
+    def __init__(self, *args, **kwargs):
+        super(SQLCompiler, self).__init__(*args, **kwargs)
+        self.subquery = None
+        self.root_alias = None
 
     def get_from_clause(self):
         """
@@ -63,7 +50,9 @@ class SQLCompiler(compiler.SQLCompiler):
         self.quote_cache[name] = r
         return r
 
-    def execute_sql(self, result_type=constants.MULTI, chunked_fetch=False, chunk_size=constants.GET_ITERATOR_CHUNK_SIZE):
+    # patched and simplified the parend method  # pylint:disable=no-else-return
+    def execute_sql(self, result_type=constants.MULTI, chunked_fetch=False,
+                    chunk_size=constants.GET_ITERATOR_CHUNK_SIZE):
         """
         Run the query against the database and returns the result(s). The
         return value is a single data item if result_type is SINGLE, or an
@@ -86,7 +75,8 @@ class SQLCompiler(compiler.SQLCompiler):
             else:
                 return
 
-        cursor = self.connection.cursor(self.query)
+        cursor = self.connection.cursor()
+        cursor.prepare_query(self.query)
         cursor.execute(sql, params)
 
         if not result_type or result_type == 'cursor':
@@ -96,16 +86,19 @@ class SQLCompiler(compiler.SQLCompiler):
             return cursor.fetchone()
 
         # The MULTI case.
-        result = iter((lambda: cursor.fetchmany(chunk_size)),
-                self.connection.features.empty_fetchmany_value)
+        result = iter(lambda: cursor.fetchmany(chunk_size),
+                      self.connection.features.empty_fetchmany_value)
         if not chunked_fetch and not self.connection.features.can_use_chunked_reads:
             # If we are using non-chunked reads, we return the same data
             # structure as normally, but ensure it is all read into memory
             # before going any further. Use chunked_fetch if requested.
             return list(result)
         return result
+        # pylint:enable=no-else-return
 
-    def as_sql(self, with_limits=True, with_col_aliases=False, subquery=False):
+    def as_sql(self, with_limits=True, with_col_aliases=False, subquery=False):  # pylint:disable=arguments-differ
+        # the argument `subquery` is only for old Django 1.10
+        # pylint:disable=too-many-locals,too-many-branches,too-many-statements
         """
         Creates the SQL for this query. Returns the SQL string and list of
         parameters.
@@ -118,9 +111,8 @@ class SQLCompiler(compiler.SQLCompiler):
         # However we do not want to get rid of stuff done in pre_sql_setup(),
         # as the pre_sql_setup will modify query state in a way that forbids
         # another run of it.
-        if DJANGO_19_PLUS:
-            if with_limits and self.query.low_mark == self.query.high_mark:
-                return '', ()
+        if with_limits and self.query.low_mark == self.query.high_mark:
+            return '', ()
         self.subquery = subquery
         refcounts_before = self.query.alias_refcount.copy()
         soql_trans = self.query_topology()
@@ -134,12 +126,8 @@ class SQLCompiler(compiler.SQLCompiler):
             # docstring of get_from_clause() for details.
             from_, f_params = self.get_from_clause()
 
-            if DJANGO_19_PLUS:
-                where, w_params = self.compile(self.where) if self.where is not None else ("", [])
-                having, h_params = self.compile(self.having) if self.having is not None else ("", [])
-            else:
-                where, w_params = self.compile(self.query.where)
-                having, h_params = self.compile(self.query.having)
+            where, w_params = self.compile(self.where) if self.where is not None else ("", [])
+            having, h_params = self.compile(self.having) if self.having is not None else ("", [])
             params = []
             result = ['SELECT']
 
@@ -224,6 +212,7 @@ class SQLCompiler(compiler.SQLCompiler):
             self.query.reset_refcounts(refcounts_before)
 
     def query_topology(self, _alias_map_items=None):
+        # pylint:disable=too-many-locals,too-many-branches
         # SOQL for SFDC requires:
         # - multiple (N-1) relations between (N) tables are possible
         # - exactly one top controlling table
@@ -243,8 +232,9 @@ class SQLCompiler(compiler.SQLCompiler):
             alias_map_items = _alias_map_items
         else:
             alias_map_items = [(getattr(v, 'parent_alias', None), v.table_name,
-                               getattr(v, 'join_cols', None), v.table_alias
-                              ) for v in query.alias_map.values()]
+                                getattr(v, 'join_cols', None), v.table_alias
+                                ) for v in query.alias_map.values()
+                               ]
         # Analyze
         alias2table = {}
         side_l, side_r = set(), set()
@@ -284,7 +274,7 @@ class SQLCompiler(compiler.SQLCompiler):
                         lhs, rhs = rhs, lhs
                         join_cols = join_cols[1], join_cols[0]
                     if lhs in work_lhses:
-                        assert not rhs in soql_trans
+                        assert rhs not in soql_trans
                         if join_cols[0].endswith('__c'):
                             fkey = re.sub('__c$', '__r', join_cols[0])
                         else:
@@ -298,117 +288,97 @@ class SQLCompiler(compiler.SQLCompiler):
         return self.soql_trans
 
 
-class SalesforceWhereNode(where.WhereNode):
-    overridden_types = ['isnull']
+class SalesforceWhereNode(sql_where.WhereNode):
 
-    # TODO compare, how much it is updated to 1.7
-    # TODO though there is no problem, update to Django 1.8 - 1.10!
-    # patched "django.db.models.sql.where.WhereNode.as_sql" from Django 1.5, 1.6., 1.7
-    def as_sql(self, qn, connection):
+    # patched "django.db.models.sql.where.WhereNode.as_sql" from Django 1.10, 1.11, 2.0, 2.1
+    # pylint:disable=no-else-return,too-many-branches,too-many-locals,unused-argument
+    def as_salesforce(self, compiler, connection):
         """
-        Returns the SQL version of the where clause and the value to be
-        substituted in. Returns '', [] if this node matches everything,
-        None, [] if this node is empty, and raises EmptyResultSet if this
+        Return the SQL version of the where clause and the value to be
+        substituted in. Return '', [] if this node matches everything,
+        None, [] if this node is empty, and raise EmptyResultSet if this
         node can't match anything.
         """
-        # Note that the logic here is made slightly more complex than
-        # necessary because there are two kind of empty nodes: Nodes
-        # containing 0 children, and nodes that are known to match everything.
-        # A match-everything node is different than empty node (which also
-        # technically matches everything) for backwards compatibility reasons.
-        # Refs #5261.
 
-        if not isinstance(qn, SQLCompiler):
+        # *** patch 1 (add) begin
+        # # prepare SOQL translations
+        if not isinstance(compiler, SQLCompiler):
             # future fix for DJANGO_20_PLUS, when deprecated "use_for_related_fields"
             # removed from managers,
             # "str(<UpdateQuery...>)" or "<UpdateQuery...>.get_compiler('default').as_sql()"
-            return super(SalesforceWhereNode, self).as_sql(qn, connection)
+            return super(SalesforceWhereNode, self).as_sql(compiler, connection)
+        soql_trans = compiler.query_topology()
+        # *** patch 1 end
 
-        soql_trans = qn.query_topology()
         result = []
         result_params = []
-        everything_childs, nothing_childs = 0, 0
-        non_empty_childs = len(self.children)
+        if self.connector == AND:
+            full_needed, empty_needed = len(self.children), 1
+        else:
+            full_needed, empty_needed = 1, len(self.children)
 
         for child in self.children:
             try:
-                assert hasattr(child, 'as_sql')
-                sql, params = qn.compile(child)
+                sql, params = compiler.compile(child)
             except EmptyResultSet:
-                nothing_childs += 1
+                empty_needed -= 1
             else:
                 if sql:
+
+                    # *** patch 2 (add) begin
+                    # # translate the alias of child to SOQL name
                     x_match = re.match(r'(\w+)\.(.*)', sql)
                     if x_match:
                         x_table, x_field = x_match.groups()
                         sql = '%s.%s' % (soql_trans[x_table], x_field)
-                        #print('sql params:', sql, params)
+                        # print('sql params:', sql, params)
+                    # *** patch 2 end
+
                     result.append(sql)
                     result_params.extend(params)
                 else:
-                    if sql is None:
-                        # Skip empty childs totally.
-                        non_empty_childs -= 1
-                        continue
-                    everything_childs += 1
+                    full_needed -= 1
             # Check if this node matches nothing or everything.
             # First check the amount of full nodes and empty nodes
             # to make this node empty/full.
-            if self.connector == AND:
-                full_needed, empty_needed = non_empty_childs, 1
-            else:
-                full_needed, empty_needed = 1, non_empty_childs
             # Now, check if this node is full/empty using the
             # counts.
-            if empty_needed - nothing_childs <= 0:
+            if empty_needed == 0:
                 if self.negated:
                     return '', []
                 else:
                     raise EmptyResultSet
-            if full_needed - everything_childs <= 0:
+            if full_needed == 0:
                 if self.negated:
                     raise EmptyResultSet
                 else:
                     return '', []
-
-        if non_empty_childs == 0:
-            # All the child nodes were empty, so this one is empty, too.
-            return None, []
         conn = ' %s ' % self.connector
         sql_string = conn.join(result)
         if sql_string:
             if self.negated:
-                # patch begin
-                # SOQL requires parentheses around "NOT" if combined with AND/OR
+                # *** patch 3 (remove) begin
+                # # Some backends (Oracle at least) need parentheses
+                # # around the inner SQL in the negated case, even if the
+                # # inner SQL contains just a single expression.
                 # sql_string = 'NOT (%s)' % sql_string
+                # *** patch 3 (add)
+                # SOQL requires parentheses around "NOT" expression, if combined with AND/OR
                 sql_string = '(NOT (%s))' % sql_string
-                # patch end
-            elif len(result) > 1:
+                # *** patch 3 end
+
+            # *** patch 4 (combine two versions into one compatible) begin
+            # elif len(result) > 1:                                    # Django 1.10, 1.11
+            # elif len(result) > 1 or self.resolved:                   # Django 2.0, 2.1
+            elif len(result) > 1 or getattr(self, 'resolved', False):  # compatible code
+                # *** patch 4 end
+
                 sql_string = '(%s)' % sql_string
         return sql_string, result_params
-
-    def add(self, data, conn_type, **kwargs):
-        # The filter lookup `isnull` is very special and can not be
-        # replaced only by `models.Field.register_lookup`. Otherwise the
-        # register_lookup is preferred.
-        cond = isinstance(data, models.lookups.IsNull) and not isinstance(data, IsNull)
-        if cond:
-            # "lhs" and "rhs" means Left and Right Hand Side of an condition
-            data = IsNull(data.lhs, data.rhs)
-        return super(SalesforceWhereNode, self).add(data, conn_type, **kwargs)
-
-    as_salesforce = as_sql
-    del as_sql
-
-#   def as_salesforce(self, qn, connection):
-#       import pprint
-#       print('join_map:')
-#       pprint.PrettyPrinter(width=80).pprint(qn.query.join_map)
-#       import pdb; pdb.set_trace()
-#       return self.as_sql(qn, connection)
+    # pylint:enable=no-else-return,too-many-branches,too-many-locals,unused-argument
 
 
-class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
+class SQLInsertCompiler(sql_compiler.SQLInsertCompiler, SQLCompiler):
     def execute_sql(self, return_id=False):
         # copied from Django 1.11, except one line patch
         assert not (
@@ -434,59 +404,13 @@ class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
         return super(SQLInsertCompiler, self).execute_sql(return_id)
 
 
-class SQLDeleteCompiler(compiler.SQLDeleteCompiler, SQLCompiler):
-    pass
-
-class SQLUpdateCompiler(compiler.SQLUpdateCompiler, SQLCompiler):
-    pass
-
-class SQLAggregateCompiler(compiler.SQLAggregateCompiler, SQLCompiler):
+class SQLDeleteCompiler(sql_compiler.SQLDeleteCompiler, SQLCompiler):
     pass
 
 
-# Lookups
-class IsNull(models.lookups.IsNull):
-    # The expected result base class above is `models.lookups.IsNull`.
-    lookup_name = 'isnull'
-
-    def as_sql(self, qn, connection):
-        if connection.vendor == 'salesforce':
-            sql, params = qn.compile(self.lhs)
-            return ('%s %s null' % (sql, ('=' if self.rhs else '!='))), params
-        else:
-            return super(IsNull, self).as_sql(qn, connection)
-
-models.Field.register_lookup(IsNull)
+class SQLUpdateCompiler(sql_compiler.SQLUpdateCompiler, SQLCompiler):
+    pass
 
 
-class Range(models.lookups.Range):
-    # The expected result base class above is `models.lookups.Range`.
-    lookup_name = 'range'
-
-    def as_sql(self, qn, connection):
-        if connection.vendor == 'salesforce':
-            lhs, lhs_params = self.process_lhs(qn, connection)
-            rhs, rhs_params = self.process_rhs(qn, connection)
-            assert tuple(rhs) == ('%s', '%s')  # tuple in Django 1.11+, list in old Django
-            assert len(rhs_params) == 2
-            params = lhs_params + [rhs_params[0]] + lhs_params + [rhs_params[1]]
-            # The symbolic parameters %s are again substituted by %s. The real
-            # parameters will be passed finally directly to CursorWrapper.execute
-            return '(%s >= %s AND %s <= %s)' % (lhs, rhs[0], lhs, rhs[1]), params
-        else:
-            return super(Range, self).as_sql(qn, connection)
-
-models.Field.register_lookup(Range)
-
-def count_as_salesforce(self, *args, **kwargs):
-    if (len(self.source_expressions) == 1 and
-            isinstance(self.source_expressions[0], models.expressions.Value) and
-            self.source_expressions[0].value == '*'):
-        return 'COUNT(Id)', []
-    else:
-        # tmp = Count('pk')
-        # args[0].query.add_annotation(Count('pk'), alias='__count', is_summary=True)
-        # obj.add_annotation(Count('*'), alias='__count', is_summary=True
-        # self.source_expressions[0] = models.expressions.Col('__count', args[0].query.model._meta.fields[0])  #'Id'
-        return self.as_sql(*args, **kwargs)
-setattr(django.db.models.aggregates.Count, 'as_salesforce', count_as_salesforce)
+class SQLAggregateCompiler(sql_compiler.SQLAggregateCompiler, SQLCompiler):
+    pass

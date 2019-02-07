@@ -6,12 +6,14 @@
 #
 
 from __future__ import absolute_import, unicode_literals
-from salesforce import models
-from salesforce.models import SalesforceModel as SalesforceModelParent
 
 import django
 from django.conf import settings
 from django.utils.encoding import python_2_unicode_compatible
+
+from salesforce import models
+from salesforce.models import SalesforceModel as SalesforceModelParent
+
 
 SALUTATIONS = [
     'Mr.', 'Ms.', 'Mrs.', 'Dr.', 'Prof.'
@@ -84,7 +86,7 @@ class AbstractAccount(SalesforceModel):
         abstract = True
 
     def __str__(self):
-        return self.Name
+        return self.Name  # pylint: disable=no-member
 
 
 class CoreAccount(AbstractAccount):
@@ -110,10 +112,10 @@ class PersonAccount(AbstractAccount):
 
 
 if getattr(settings, 'PERSON_ACCOUNT_ACTIVATED', False):
-    class Account(PersonAccount):
+    class Account(PersonAccount):  # pylint:disable=model-no-explicit-unicode
         pass
 else:
-    class Account(CoreAccount):
+    class Account(CoreAccount):    # pylint:disable=model-no-explicit-unicode
         pass
 
 
@@ -310,7 +312,7 @@ class OpportunityContactRole(SalesforceModel):
 
 
 try:
-    import salesforce.testrunner.dynamic_models.models as models_template
+    from salesforce.testrunner.example import models_template
 except ImportError:
     # this is useful for the case that the model is being rewritten by inspectdb
     models_template = None
@@ -331,7 +333,8 @@ class Organization(models.Model):
         # Copy all fields that match the patters for Force.com field name
         # from the class that use the same db_table "Organization" in the
         # module models_template
-        dynamic_field_patterns = models_template, ['CreatedById', 'Last.*Id']
+        if models_template:
+            dynamic_field_patterns = models_template, ['created_by', 'last.*_by']
 
 
 class Test(SalesforceParentModel):
@@ -399,3 +402,8 @@ class ApexEmailNotification(models.Model):
                                 on_delete=models.DO_NOTHING, blank=True, null=True)
     # Users of your org to notify when unhandled Apex exceptions occur.
     email = models.CharField(unique=True, max_length=255, verbose_name='email', blank=True)
+
+
+class Campaign(models.Model):
+    name = models.CharField(max_length=80)
+    number_sent = models.DecimalField(max_digits=18, decimal_places=0, verbose_name='Num Sent', blank=True, null=True)

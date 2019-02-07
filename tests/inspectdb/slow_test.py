@@ -11,6 +11,7 @@ $ python manage.py check
 $ python tests/inspectdb/slow_test.py
 """
 
+from inspect import isclass
 from sys import stdout, stderr
 import os
 import sys
@@ -18,9 +19,10 @@ import sys
 import django
 sys.path.insert(0, '.')
 os.environ['DJANGO_SETTINGS_MODULE'] = 'tests.inspectdb.settings'
+
 django.setup()
 
-# there 3 lines- must be imported after: path, environ, django.setup()
+# these 3 lines must be imported after: path, environ, django.setup()
 from django.db import connections  # NOQA
 from tests.inspectdb import models as mdl  # NOQA
 from salesforce.backend.base import SalesforceError  # NOQA
@@ -32,6 +34,7 @@ sf = connections['salesforce']
 def run():
     start_name = sys.argv[1] if sys.argv[1:] else ''
     n_tables = n_read = n_no_data = n_read_errors = n_write = n_write_errors = 0
+    sf.cursor()  # this must connect manually  # TODO fix it automatically if reasonable
     for tab in sf.introspection.table_list_cache['sobjects']:
         if tab['retrieveable'] and not tab['name'] in (
                 # These require specific filters (descried in their error messages)
@@ -49,8 +52,7 @@ def run():
             if tab['name'] < start_name:
                 continue
             [test_class] = [cls for cls in (getattr(mdl, x) for x in dir(mdl))
-                            if (isinstance(cls, type) and
-                                issubclass(cls, django.db.models.Model) and
+                            if (isclass(cls) and issubclass(cls, django.db.models.Model) and
                                 cls._meta.db_table == tab['name'])
                             ]
             stdout.write('%s ' % tab['name'])
@@ -58,8 +60,8 @@ def run():
             try:
                 n_read += 1
                 obj = test_class.objects.all()[0]
-            except SalesforceError as e:
-                stderr.write("\n************** %s %s\n" % (tab['name'], e))
+            except SalesforceError as exc:
+                stderr.write("\n************** %s %s\n" % (tab['name'], exc))
                 n_read_errors += 1
             except IndexError:
                 n_no_data += 1
@@ -98,8 +100,8 @@ def run():
                 try:
                     n_write += 1
                     obj.save(force_update=True)
-                except SalesforceError as e:
-                    stderr.write("\n************** %s %s\n" % (tab['name'], e))
+                except SalesforceError as exc:
+                    stderr.write("\n************** %s %s\n" % (tab['name'], exc))
                     n_write_errors += 1
                 else:
                     # object 'Topic' doesn't have the attribute 'last_modified_date'
@@ -114,6 +116,7 @@ def run():
                   n_read_errors=n_read_errors, n_write=n_write, n_write_errors=n_write_errors))
     print('********* ERRORs found' if n_read_errors + n_write_errors else 'OK')
     return n_read_errors + n_write_errors == 0
+
 
 if __name__ == '__main__':
     ok = run()

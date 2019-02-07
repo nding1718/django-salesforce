@@ -1,6 +1,7 @@
 """
 Tests that do not need to connect servers
 """
+# pylint:disable=deprecated-method,too-many-ancestors,unused-variable
 
 from django.apps.registry import Apps
 from django.test import TestCase
@@ -8,19 +9,19 @@ from django.db.models import DO_NOTHING
 from salesforce import fields, models
 from salesforce.testrunner.example.models import (
         Contact, Opportunity, OpportunityContactRole, ChargentOrder)
+from salesforce.backend.test_helpers import LazyTestMixin
 
 # from salesforce.backend.subselect import TestSubSelectSearch
-import salesforce
 
 
 class EasyCharField(models.CharField):
     def __init__(self, max_length=255, null=True, default='', **kwargs):
-        return super(EasyCharField, self).__init__(max_length=max_length, null=null, default=default, **kwargs)
+        super(EasyCharField, self).__init__(max_length=max_length, null=null, default=default, **kwargs)
 
 
 class EasyForeignKey(models.ForeignKey):
     def __init__(self, othermodel, on_delete=DO_NOTHING, **kwargs):
-        return super(EasyForeignKey, self).__init__(othermodel, on_delete=on_delete, **kwargs)
+        super(EasyForeignKey, self).__init__(othermodel, on_delete=on_delete, **kwargs)
 
 
 class TestField(TestCase):
@@ -86,7 +87,7 @@ class TestField(TestCase):
              'MyCustomForeignField__c')
 
 
-class TestQueryCompiler(TestCase):
+class TestQueryCompiler(TestCase, LazyTestMixin):
     def test_namespaces_auto(self):
         """Verify that the database column name can be correctly autodetected
 
@@ -103,28 +104,28 @@ class TestQueryCompiler(TestCase):
         This test is very similar to the required example in PR #103.
         """
         qs = OpportunityContactRole.objects.filter(
-                role='abc',
-                opportunity__in=Opportunity.objects.filter(stage='Prospecting'))
+            role='abc',
+            opportunity__in=Opportunity.objects.filter(stage='Prospecting')
+        )
         sql, params = qs.query.get_compiler('salesforce').as_sql()
         self.assertRegexpMatches(sql,
                                  "WHERE Opportunity.StageName =",
                                  "Probably because aliases are invalid for SFDC, e.g. 'U0.StageName'")
         self.assertRegexpMatches(sql,
-                                 'SELECT .*OpportunityContactRole\.Role.* '
-                                 'FROM OpportunityContactRole WHERE \(.* AND .*\)')
+                                 r'SELECT .*OpportunityContactRole\.Role.* '
+                                 r'FROM OpportunityContactRole WHERE \(.* AND .*\)')
         self.assertRegexpMatches(sql,
-                                 'OpportunityContactRole.OpportunityId IN '
-                                 '\(SELECT Opportunity\.Id FROM Opportunity WHERE Opportunity\.StageName = %s ?\)')
+                                 r'OpportunityContactRole.OpportunityId IN '
+                                 r'\(SELECT Opportunity\.Id FROM Opportunity WHERE Opportunity\.StageName = %s ?\)')
         self.assertRegexpMatches(sql, 'OpportunityContactRole.Role = %s')
 
     def test_none_method_queryset(self):
         """Test that none() method in the queryset returns [], not error"""
-        request_count_0 = salesforce.backend.driver.request_count
-        self.assertEqual(tuple(Contact.objects.none()), ())
-        self.assertEqual(tuple(Contact.objects.all().none().all()), ())
-        self.assertTrue('[]' in repr(Contact.objects.none()))
-        self.assertEqual(salesforce.backend.driver.request_count, request_count_0,
-                         "Do database requests should be done with .none() method")
+        with self.lazy_assert_n_requests(0, "No database requests should be run for .none() method"):
+            self.assertEqual(tuple(Contact.objects.none()), ())
+            self.assertEqual(tuple(Contact.objects.all().none().all()), ())
+            self.assertTrue('[]' in repr(Contact.objects.none()))
+        self.lazy_check()
 
 
 class TestTopologyCompiler(TestCase):
@@ -136,7 +137,7 @@ class TestTopologyCompiler(TestCase):
     def test_topology_compiler(self):
         # Contact.objects.all()
         # SELECT Contact.Id FROM Contact
-        self.assertTopo([(None, 'Contact', None, 'Contact')],     {'Contact': 'Contact'})
+        self.assertTopo([(None, 'Contact', None, 'Contact')], {'Contact': 'Contact'})
         # Custom.objects.all()
         # SELECT Custom__c.Id FROM Custom__c
         self.assertTopo([(None, 'Custom__c', None, 'Custom__c')], {'Custom__c': 'Custom__c'})
@@ -162,7 +163,7 @@ class TestTopologyCompiler(TestCase):
     def test_many2many(self):
         # C (Id, AId, BId) - child,  A (Id) - first parent, B (Id) - second parent
         alias_map_items = [
-                (None, 'A', None, 'A'),
-                ('A', 'C', (('Id', 'AId'),), 'C'),
-                ('C', 'B', (('BId', 'Id'),), 'B')]
+            (None, 'A', None, 'A'),
+            ('A', 'C', (('Id', 'AId'),), 'C'),
+            ('C', 'B', (('BId', 'Id'),), 'B')]
         self.assertTopo(alias_map_items, {'C': 'C', 'A': 'C.A', 'B': 'C.B'})

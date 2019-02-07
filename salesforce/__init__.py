@@ -11,22 +11,8 @@ A database backend for the Django ORM.
 Allows access to all Salesforce objects accessible via the SOQL API.
 """
 import logging
-import warnings
 
-import django
-
-__version__ = "0.7.2"
-
-DJANGO_18_PLUS = True  # unused by us now - backward compatibility
-DJANGO_19_PLUS = django.VERSION[:2] >= (1, 9)
-DJANGO_110_PLUS = django.VERSION[:2] >= (1, 10)
-DJANGO_111_PLUS = django.VERSION[:2] >= (1, 11)
-DJANGO_20_PLUS = django.VERSION[:2] >= (2, 0)
-if django.VERSION[:2] < (1, 10):
-    # Statistically three or more blocking issues can be expected by every
-    # new major Django version. Strict check before support is better.
-    raise ImportError("Django version of at least 1.10 is required "
-                      "for this django-salesforce.")
+__version__ = "0.8.beta"
 
 log = logging.getLogger(__name__)
 

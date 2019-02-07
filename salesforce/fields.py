@@ -6,34 +6,34 @@
 #
 
 """
-Adds support for Salesforce primary keys.
+Customized fields for Salesforce, especially the primary key. (like django.db.models.fields)
 """
 
 import warnings
+from decimal import Decimal
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.translation import ugettext_lazy as _
 from django.db.models import fields
-from django.db.models import PROTECT, DO_NOTHING  # NOQA
+from django.db.models import PROTECT, DO_NOTHING  # NOQA pylint:disable=unused-import
 from django.db import models
 from django.utils.encoding import smart_text
 from django.utils.six import string_types
 
-from salesforce import DJANGO_19_PLUS
 from salesforce.backend.operations import DefaultedOnCreate
 
 # None of field types defined in this module need a "deconstruct" method,
 # in Django 1.7+, because their parameters only describe fixed nature of SF
 # standard objects that can not be modified no ways by no API or spell.
 
-FULL_WRITABLE  = 0
+FULL_WRITABLE = 0
 NOT_UPDATEABLE = 1
 NOT_CREATEABLE = 2
 READ_ONLY = 3  # (NOT_UPDATEABLE & NOT_CREATEABLE)
 DEFAULTED_ON_CREATE = DefaultedOnCreate()
 
 SF_PK = getattr(settings, 'SF_PK', 'id')
-if not SF_PK in ('id', 'Id'):
+if SF_PK not in ('id', 'Id'):
     raise ImproperlyConfigured("Value of settings.SF_PK must be 'id' or 'Id' or undefined.")
 
 
@@ -58,25 +58,31 @@ class SalesforceAutoField(fields.AutoField):
     def get_prep_value(self, value):
         return self.to_python(value)
 
-    def contribute_to_class(self, cls, name):
+    def contribute_to_class(self, cls, name, **kwargs):
         name = name if self.name is None else self.name
         # we can't require "self.auto_created==True" due to backward compatibility
         # with old migrations created before v0.6. Other conditions are enough.
         if name != SF_PK or not self.primary_key:
-            raise ImproperlyConfigured("SalesforceAutoField must be a primary"
-                    "key with the name '%s' (as configured by settings)." % SF_PK)
-        if bool(cls._meta.auto_field):
-            if (type(self) == type(cls._meta.auto_field) and self.model._meta.abstract and
+            raise ImproperlyConfigured(
+                "SalesforceAutoField must be a primary key"
+                "with the name '%s' (configurable by settings)." % SF_PK)
+        if cls._meta.auto_field:
+            # pylint:disable=unidiomatic-typecheck
+            if not (type(self) == type(cls._meta.auto_field) and self.model._meta.abstract and  # NOQA type eq
                     cls._meta.auto_field.name == SF_PK):
-                # A model is created  that inherits fields from more abstract classes
-                # with the same default SalesforceAutoFieldy. Therefore the second should be
-                # ignored.
-                return
-            else:
-                raise ImproperlyConfigured("The model %s can not have more than one AutoField, "
-                        "but currently: (%s=%s, %s=%s)"
-                        % (cls, cls._meta.auto_field.name, cls._meta.auto_field, name, self))
-        super(SalesforceAutoField, self).contribute_to_class(cls, name)
+                raise ImproperlyConfigured(
+                    "The model %s can not have more than one AutoField, "
+                    "but currently: (%s=%s, %s=%s)" % (
+                        cls,
+                        cls._meta.auto_field.name, cls._meta.auto_field,
+                        name, self
+                    )
+                )
+            # A model is created  that inherits fields from more abstract classes
+            # with the same default SalesforceAutoFieldy. Therefore the second should be
+            # ignored.
+            return
+        super(SalesforceAutoField, self).contribute_to_class(cls, name, **kwargs)
         cls._meta.auto_field = self
 
 
@@ -126,8 +132,10 @@ class SfField(models.Field):
                 column = self.sf_namespace + column + '__c'
         return attname, column
 
-    def contribute_to_class(self, cls, name, **kwargs):
-        super(SfField, self).contribute_to_class(cls, name, **kwargs)
+    def contribute_to_class(self, cls, name, private_only=False, **kwargs):
+        # Different arguments are in Django 1.11 vs. 2.0, therefore we use universal **kwargs
+        # pylint:disable=arguments-differ
+        super(SfField, self).contribute_to_class(cls, name, private_only=private_only, **kwargs)
         if self.sf_custom is None and hasattr(cls._meta, 'sf_custom'):
             # Only custom fields in models explicitly marked by
             # Meta custom=True are recognized automatically - for
@@ -137,16 +145,24 @@ class SfField(models.Field):
             self.sf_namespace = cls._meta.db_table.split('__')[0] + '__'
         self.set_attributes_from_name(name)
 
+# pylint:disable=unnecessary-pass,too-many-ancestors
+
 
 class CharField(SfField, models.CharField):
     """CharField with sf_read_only attribute for Salesforce."""
     pass
+
+
 class EmailField(SfField, models.EmailField):
     """EmailField with sf_read_only attribute for Salesforce."""
     pass
+
+
 class URLField(SfField, models.URLField):
     """URLField with sf_read_only attribute for Salesforce."""
     pass
+
+
 class TextField(SfField, models.TextField):
     """TextField with sf_read_only attribute for Salesforce."""
     pass
@@ -155,9 +171,57 @@ class TextField(SfField, models.TextField):
 class IntegerField(SfField, models.IntegerField):
     """IntegerField with sf_read_only attribute for Salesforce."""
     pass
+
+
+class BigIntegerField(SfField, models.BigIntegerField):
+    """BigIntegerField with sf_read_only attribute for Salesforce."""
+    # important for other database backends, e.g. in tests
+    # The biggest exact value is +-(2 ** 53 -1 ), approx. 9.007E15
+    pass
+
+
 class SmallIntegerField(SfField, models.SmallIntegerField):
     """SmallIntegerField with sf_read_only attribute for Salesforce."""
     pass
+
+
+class DecimalField(SfField, models.DecimalField):
+    """
+    DecimalField with sf_read_only attribute for Salesforce.
+
+    Salesforce has only one numeric type xsd:double, but no integer.
+    Even a numeric field with declared zero decimal_places can contain
+    pi=3.14159265358979 in the database accidentally, but if also the value
+    is integer,then it is without '.0'.
+    DecimalField is the default numeric type used by itrospection inspectdb.
+    """
+    def to_python(self, value):
+        if str(value) == 'DEFAULTED_ON_CREATE':
+            return value
+        ret = super(DecimalField, self).to_python(value)
+        if ret is not None and self.decimal_places == 0:
+            # this is because Salesforce has no numeric integer type
+            if ret == int(ret):
+                ret = Decimal(int(ret))
+        return ret
+
+    # parameter "context" is for Django 1.11 and older  (the same is in more classes here)
+    def from_db_value(self, value, expression, connection, context=None):
+        # pylint:disable=unused-argument
+        # TODO refactor and move to the driver like in other backends
+        if isinstance(value, float):
+            value = str(value)
+        return self.to_python(value)
+
+
+class FloatField(SfField, models.FloatField):
+    """FloatField for Salesforce.
+
+    It is Float in Python and the same as DecimalField in the database.
+    """
+    pass
+
+
 class BooleanField(SfField, models.BooleanField):
     """BooleanField with sf_read_only attribute for Salesforce."""
     def __init__(self, default=False, **kwargs):
@@ -166,52 +230,50 @@ class BooleanField(SfField, models.BooleanField):
     def to_python(self, value):
         if isinstance(value, DefaultedOnCreate):
             return value
-        else:
-            return super(BooleanField, self).to_python(value)
-
-
-class DecimalField(SfField, models.DecimalField):
-    """DecimalField with sf_read_only attribute for Salesforce."""
-    def to_python(self, value):
-        if str(value) == 'DEFAULTED_ON_CREATE':
-            return value
-        return super(DecimalField, self).to_python(value)
+        return super(BooleanField, self).to_python(value)
 
 
 class DateTimeField(SfField, models.DateTimeField):
     """DateTimeField with sf_read_only attribute for Salesforce."""
     pass
+
+
 class DateField(SfField, models.DateField):
     """DateField with sf_read_only attribute for Salesforce."""
     pass
+
+    def from_db_value(self, value, expression, connection, context=None):
+        # pylint:disable=unused-argument
+        return self.to_python(value)
+
+
 class TimeField(SfField, models.TimeField):
     """TimeField with sf_read_only attribute for Salesforce."""
-    pass
+
+    def from_db_value(self, value, expression, connection, context=None):
+        # pylint:disable=unused-argument
+        return self.to_python(value)
 
 
 class ForeignKey(SfField, models.ForeignKey):
     """ForeignKey with sf_read_only attribute and acceptable by Salesforce."""
-    def __init__(self, *args, **kwargs):
+    def __init__(self, to, on_delete, *args, **kwargs):
         # Checks parameters before call to ancestor.
-        if DJANGO_19_PLUS and args[1:2]:
-            on_delete = args[1].__name__
-        else:
-            on_delete = kwargs.get('on_delete', models.CASCADE).__name__
-        if not on_delete in ('PROTECT', 'DO_NOTHING'):
+        if on_delete.__name__ not in ('PROTECT', 'DO_NOTHING'):
             # The option CASCADE (currently fails) would be unsafe after a fix
             # of on_delete because Cascade delete is not usually enabled in SF
             # for safety reasons for most fields objects, namely for Owner,
             # CreatedBy etc. Some related objects are deleted automatically
             # by SF even with DO_NOTHING in Django, e.g. for
             # Campaign/CampaignMember
-            related_object = args[0]
-            warnings.warn("Only foreign keys with on_delete = PROTECT or "
-                    "DO_NOTHING are currently supported, not %s related to %s"
-                    % (on_delete, related_object))
-        super(ForeignKey, self).__init__(*args, **kwargs)
+            warnings.warn(
+                "Only foreign keys with on_delete = PROTECT or "
+                "DO_NOTHING are currently supported, not %s related to %s"
+                % (on_delete, to))
+        super(ForeignKey, self).__init__(to, on_delete, *args, **kwargs)
 
     def get_attname(self):
-        if self.name.islower():
+        if self.name.islower():  # pylint:disable=no-else-return
             # the same as django.db.models.fields.related.ForeignKey.get_attname
             return '%s_id' % self.name
         else:

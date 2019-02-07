@@ -12,13 +12,9 @@ conversion).
 """
 
 from django.db import connections
-from .backend.driver import DatabaseError, InterfaceError
-import salesforce
 
-try:
-    import beatbox
-except ImportError:
-    beatbox = None
+import salesforce
+from salesforce.dbapi.driver import beatbox, DatabaseError, InterfaceError
 
 
 def get_soap_client(db_alias, client_class=None):
@@ -28,7 +24,6 @@ def get_soap_client(db_alias, client_class=None):
     The default created client is "beatbox.PythonClient", but an
     alternative client is possible. (i.e. other subtype of beatbox.XMLClient)
     """
-    from .backend.query import CursorWrapper
     if not beatbox:
         raise InterfaceError("To use SOAP API, you'll need to install the Beatbox package.")
     if client_class is None:
@@ -38,18 +33,18 @@ def get_soap_client(db_alias, client_class=None):
     # authenticate
     connection = connections[db_alias]
     # verify the authenticated connection, because Beatbox can not refresh the token
-    cursor = CursorWrapper(connection)
+    cursor = connection.cursor()
     cursor.urls_request()
     auth_info = connections[db_alias].sf_session.auth
 
-    access_token = connections[db_alias].sf_session.auth.get_auth()['access_token']
+    access_token = auth_info.get_auth()['access_token']
     assert access_token[15] == '!'
     org_id = access_token[:15]
     url = '/services/Soap/u/{version}/{org_id}'.format(version=salesforce.API_VERSION,
                                                        org_id=org_id)
-    soap_client.useSession(access_token,
-                           connections[db_alias].sf_session.auth.instance_url + url)
+    soap_client.useSession(access_token, auth_info.instance_url + url)
     return soap_client
+
 
 def convert_lead(lead, converted_status=None, **kwargs):
     """
@@ -63,7 +58,7 @@ def convert_lead(lead, converted_status=None, **kwargs):
 
     kwargs: additional optional parameters according docs
     https://developer.salesforce.com/docs/atlas.en-us.api.meta/api/sforce_api_calls_convertlead.htm
-    e.g. `accountId` if the Lead should be merged with an existing Account. 
+    e.g. `accountId` if the Lead should be merged with an existing Account.
 
     Return value:
         {'accountId':.., 'contactId':.., 'leadId':.., 'opportunityId':.., 'success':..}
@@ -84,6 +79,7 @@ def convert_lead(lead, converted_status=None, **kwargs):
 
     for more details.
     """
+    # pylint:disable=protected-access
     if not beatbox:
         raise InterfaceError("To use convert_lead, you'll need to install the Beatbox library.")
 
@@ -105,17 +101,16 @@ def convert_lead(lead, converted_status=None, **kwargs):
     ret = dict((x._name[1], str(x)) for x in response)
 
     if "errors" in str(ret):
-        raise DatabaseError("The Lead conversion failed: {0}, leadId={1}".format(
-                ret['errors'], ret['leadId']))
-
+        raise DatabaseError("The Lead conversion failed: {0}, leadId={1}"
+                            .format(ret['errors'], ret['leadId']))
     return ret
+
 
 def set_highest_api_version(db_aliases):
     """Set the highest version of Force.com API supported by all databases in db_aliases
     """
-    from .backend.query import CursorWrapper
     if not isinstance(db_aliases, (list, tuple)):
         db_aliases = [db_aliases]
-    max_version = max(CursorWrapper(connections[db_alias]).versions_request()[-1]['version']
-                       for db_alias in db_aliases)
+    max_version = max(connections[db_alias].cursor().versions_request()[-1]['version']
+                      for db_alias in db_aliases)
     setattr(salesforce, 'API_VERSION', max_version)

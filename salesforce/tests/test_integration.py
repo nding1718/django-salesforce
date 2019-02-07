@@ -4,31 +4,41 @@
 # (c) 2012-2013 Freelancers Union (http://www.freelancersunion.org)
 # See LICENSE.md for details
 #
-from decimal import Decimal
-from distutils.util import strtobool
-import datetime
-import os
-import pytz
+# pylint:disable=deprecated-method,invalid-name,protected-access,too-many-lines,unused-variable
 
+from decimal import Decimal
+from distutils.util import strtobool  # pylint: disable=no-name-in-module,import-error # venv inst pylint false positiv
+import datetime
+import logging
+import os
+import re
+import warnings
+
+import pytz
 from django.conf import settings
 from django.db import connections
 from django.db.models import Q, Avg, Count, Sum, Min, Max
 from django.test import TestCase
 from django.utils import timezone
+from django.utils.six import PY3, text_type
 
-from salesforce.testrunner.example.models import (Account, Contact, Lead, User,
-        ApexEmailNotification, BusinessHours, ChargentOrder, CronTrigger,
+import salesforce
+from salesforce import router
+from salesforce.backend import DJANGO_20_PLUS
+from salesforce.backend.test_helpers import (  # NOQA pylint:disable=unused-import
+    expectedFailure, expectedFailureIf, skip, skipUnless)
+from salesforce.backend.test_helpers import (
+    current_user, default_is_sf, sf_alias, uid_version as uid,
+    QuietSalesforceErrors, LazyTestMixin)
+from salesforce.dbapi.exceptions import SalesforceWarning
+from salesforce.testrunner.example.models import (
+        Account, Contact, Lead, User,
+        ApexEmailNotification, BusinessHours, Campaign, CronTrigger,
         Opportunity, OpportunityContactRole,
         Product, Pricebook, PricebookEntry, Note, Task,
         Organization, models_template,
         )
-from salesforce import router, DJANGO_110_PLUS, DJANGO_111_PLUS, DJANGO_20_PLUS
-import salesforce
-from ..backend.test_helpers import skip, skipUnless, expectedFailure, expectedFailureIf # test decorators
-from ..backend.test_helpers import current_user, default_is_sf, sf_alias, uid_version as uid
-from ..backend.test_helpers import no_soap_decorator
 
-import logging
 log = logging.getLogger(__name__)
 
 QUIET_KNOWN_BUGS = strtobool(os.getenv('QUIET_KNOWN_BUGS', 'false'))
@@ -36,11 +46,14 @@ test_email = 'test-djsf-unittests%s@example.com' % uid
 sf_databases = [db for db in connections if router.is_sf_database(db)]
 
 _sf_tables = []
+
+
 def sf_tables():
     if not _sf_tables and default_is_sf:
         for x in connections[sf_alias].introspection.table_list_cache['sobjects']:
             _sf_tables.append(x['name'])
     return _sf_tables
+
 
 def refresh(obj):
     """Get the same object refreshed from the same db.
@@ -49,8 +62,11 @@ def refresh(obj):
     return type(obj).objects.using(db).get(pk=obj.pk)
 
 
-class BasicSOQLRoTest(TestCase):
+class BasicSOQLRoTest(TestCase, LazyTestMixin):
     """Tests that need no setUp/tearDown"""
+    # pylint:disable=no-self-use,pointless-statement
+
+    databases = '__all__'
 
     @classmethod
     def setUpClass(cls):
@@ -59,7 +75,7 @@ class BasicSOQLRoTest(TestCase):
         some_contacts = Contact.objects.all()[:2]
         if len(some_contacts) < 2:
             for i in range(2 - len(some_contacts)):
-                contact = Contact(first_name='sf_test demo', last_name='Test %d' %i)
+                contact = Contact(first_name='sf_test demo', last_name='Test %d' % i)
                 contact.save()
         if User.objects.count() == 0:
             user = User(Username=current_user)
@@ -67,28 +83,46 @@ class BasicSOQLRoTest(TestCase):
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     def test_raw(self):
-        """Get the first two contact records.
+        """Read two contacts by raw.
 
         (At least 3 manually created Contacts must exist before these read-only tests.)
         """
-        contacts = Contact.objects.raw(
+        with self.lazy_assert_n_requests(1):
+            contacts = list(Contact.objects.raw(
                 "SELECT Id, LastName, FirstName FROM Contact "
-                "LIMIT 2", translation={'id': 'Id'})
-        self.assertEqual(len(contacts), 2)
-        # It had a side effect that the same assert failed second times.
-        self.assertEqual(len(contacts), 2)
-        '%s' % contacts[0].__dict__  # Check that all fields are accessible
+                "LIMIT 2"))
+        with self.lazy_assert_n_requests(0):
+            self.assertEqual(len(contacts), 2)
+            # It had a side effect that the same assert failed second times.
+            self.assertEqual(len(contacts), 2)
+            '%s' % contacts[0].__dict__  # Check that all fields are accessible
+        self.lazy_check()
+
+    @skipUnless(default_is_sf, "Default database should be any Salesforce.")
+    def test_raw_translations(self):
+        """Read a Contact raw and translate it to Lead fields."""
+        contact = Contact.objects.all()[0]
+        false_lead_raw = list(Lead.objects.raw(
+            "SELECT Id, LastName FROM Contact WHERE Id=%s", params=[contact.pk],
+            translations={'LastName': 'Company'}))
+        self.assertEqual(len(false_lead_raw), 1)
+        self.assertEqual(false_lead_raw[0].Company, contact.last_name)
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     def test_raw_foreignkey_id(self):
         """Get the first two contacts by raw query with a ForeignKey id field.
         """
-        contacts = Contact.objects.raw(
+        with self.lazy_assert_n_requests(1):
+            contacts = list(Contact.objects.raw(
                 "SELECT Id, LastName, FirstName, OwnerId FROM Contact "
-                "LIMIT 2")
+                "LIMIT 2"))
+        len(contacts)
         self.assertEqual(len(contacts), 2)
-        '%s' % contacts[0].__dict__  # Check that all fields are accessible
-        self.assertIn('@', contacts[0].owner.Email)
+        with self.lazy_assert_n_requests(0):
+            '%s' % contacts[0].__dict__  # Check that all fields are accessible
+        with self.lazy_assert_n_requests(1):
+            self.assertIn('@', contacts[0].owner.Email)
+        self.lazy_check()
 
     def test_select_all(self):
         """Get the first two contact records.
@@ -133,16 +167,14 @@ class BasicSOQLRoTest(TestCase):
         test_account.save()
         test_contact = Contact(first_name='sf_test', last_name='my', account=test_account)
         test_contact.save()
-        req_count_0 = salesforce.backend.driver.request_count
         try:
-            qs = Contact.objects.filter(account__Name='sf_test account').simple_select_related('account')
-            contacts = list(qs)
-            req_count_1 = salesforce.backend.driver.request_count
-            [x.account.Name for x in contacts]
-            req_count_2 = salesforce.backend.driver.request_count
-            self.assertEqual(req_count_1, req_count_0 + 2)
+            with self.lazy_assert_n_requests(2):
+                qs = Contact.objects.filter(account__Name='sf_test account').simple_select_related('account')
+                contacts = list(qs)
+            with self.lazy_assert_n_requests(0):  # this fails in Django 2.0 - not cached
+                [x.account.Name for x in contacts]
             self.assertGreaterEqual(len(contacts), 1)
-            self.assertEqual(req_count_2, req_count_1)
+            self.lazy_check()
         finally:
             test_contact.delete()
             test_account.delete()
@@ -154,7 +186,8 @@ class BasicSOQLRoTest(TestCase):
 
         current_sf_user = User.objects.get(Username=current_user)
         orig_objects = list(ApexEmailNotification.objects.filter(
-                Q(user=current_sf_user) | Q(email='apex.bugs@example.com')))
+            Q(user=current_sf_user) | Q(email='apex.bugs@example.com')))
+        _ = orig_objects  # NOQA
         try:
             notifier_u = current_sf_user.apex_email_notification
             new_u = None
@@ -173,9 +206,10 @@ class BasicSOQLRoTest(TestCase):
             duplicate = ApexEmailNotification(user=current_sf_user)
             # the method self.assertRaise was too verbose about exception
             try:
-                duplicate.save()
+                with QuietSalesforceErrors(sf_alias):
+                    duplicate.save()
             except salesforce.backend.base.SalesforceError as exc:
-                self.assertEqual(exc.data['errorCode'], 'DUPLICATE_VALUE')
+                self.assertEqual(exc.data[0]['errorCode'], 'DUPLICATE_VALUE')
             else:
                 self.assertRaises(salesforce.backend.base.SalesforceError, duplicate.save)
 
@@ -218,10 +252,7 @@ class BasicSOQLRoTest(TestCase):
         """Test inserting a date.
         """
         now = timezone.now().replace(microsecond=0)
-        contact = Contact(
-                first_name='Joe',
-                last_name='Freelancer',
-                email_bounced_date=now)
+        contact = Contact(first_name='Joe', last_name='Freelancer', email_bounced_date=now)
         contact.save()
         try:
             self.assertEqual(refresh(contact).email_bounced_date, now)
@@ -246,11 +277,10 @@ class BasicSOQLRoTest(TestCase):
         # Verify that an explicit value is possible for this field.
         other_user_obj = User.objects.exclude(Username=current_user).filter(IsActive=True)[0]
         contact = Contact(first_name='sf_test', last_name='your',
-                owner=other_user_obj)
+                          owner=other_user_obj)
         contact.save()
         try:
-            self.assertEqual(
-                    refresh(contact).owner.Username, other_user_obj.Username)
+            self.assertEqual(refresh(contact).owner.Username, other_user_obj.Username)
         finally:
             contact.delete()
 
@@ -262,9 +292,12 @@ class BasicSOQLRoTest(TestCase):
         test_contact = Contact(first_name='sf_test', last_name='my')
         test_contact.save()
         try:
-            contacts = Contact.objects.filter(Q(account__isnull=True) |
-                    Q(account=None), account=None, account__isnull=True,
-                    first_name='sf_test')
+            contacts = Contact.objects.filter(
+                Q(account__isnull=True) | Q(account=None),
+                account=None,
+                account__isnull=True,
+                first_name='sf_test'
+            )
             self.assertEqual(len(contacts), 1)
         finally:
             test_contact.delete()
@@ -273,8 +306,8 @@ class BasicSOQLRoTest(TestCase):
         """Make sure weird unicode breaks properly.
         """
         test_lead = Lead(FirstName=u'\u2603', LastName="Unittest Unicode",
-                Email='test-djsf-unicode-email@example.com',
-                Company="Some company")
+                         Email='test-djsf-unicode-email@example.com',
+                         Company="Some company")
         test_lead.save()
         try:
             self.assertEqual(refresh(test_lead).FirstName, u'\u2603')
@@ -290,7 +323,7 @@ class BasicSOQLRoTest(TestCase):
         yesterday = today - datetime.timedelta(days=1)
         tomorrow = today + datetime.timedelta(days=1)
         contact = Contact(first_name='sf_test' + uid, last_name='date',
-                email_bounced_date=today)
+                          email_bounced_date=today)
         contact.save()
         try:
             contacts1 = Contact.objects.filter(email_bounced_date__gt=yesterday, first_name='sf_test' + uid)
@@ -305,8 +338,8 @@ class BasicSOQLRoTest(TestCase):
         """Create a lead record, and make sure it ends up with a valid Salesforce ID.
         """
         test_lead = Lead(FirstName="User", LastName="Unittest Inserts",
-                Email='test-djsf-inserts-email@example.com',
-                Company="Some company")
+                         Email='test-djsf-inserts-email@example.com',
+                         Company="Some company")
         test_lead.save()
         try:
             self.assertEqual(len(test_lead.pk), 18)
@@ -329,8 +362,8 @@ class BasicSOQLRoTest(TestCase):
         """Create a lead record, then delete it, and make sure it's gone.
         """
         test_lead = Lead(FirstName="User", LastName="Unittest Deletes",
-                Email='test-djsf-delete-email@example.com',
-                Company="Some company")
+                         Email='test-djsf-delete-email@example.com',
+                         Company="Some company")
         test_lead.save()
         test_lead.delete()
 
@@ -338,29 +371,45 @@ class BasicSOQLRoTest(TestCase):
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     def test_decimal_precision(self):
-        """Verify the same precision of saved and retrived DecimalField
+        """Verify the exact precision of the saved and retrived DecimalField
         """
-        product = Product(Name="Test Product")
+        product = Product(Name="test Product")
         product.save()
 
         # The price for a product must be set in the standard price book.
         # http://www.salesforce.com/us/developer/docs/api/Content/sforce_api_objects_pricebookentry.htm
         pricebook = Pricebook.objects.get(Name="Standard Price Book")
-        saved_pricebook_entry = PricebookEntry(Product2=product, Pricebook2=pricebook, UnitPrice=Decimal('1234.56'), UseStandardPrice=False)
+        unit_price = Decimal('1234.56')
+        saved_pricebook_entry = PricebookEntry(Product2=product, Pricebook2=pricebook,
+                                               UnitPrice=unit_price, UseStandardPrice=False)
         saved_pricebook_entry.save()
         retrieved_pricebook_entry = PricebookEntry.objects.get(pk=saved_pricebook_entry.pk)
 
         try:
-            self.assertEqual(saved_pricebook_entry.UnitPrice, retrieved_pricebook_entry.UnitPrice)
+            self.assertEqual(saved_pricebook_entry.UnitPrice, unit_price)
+            self.assertEqual(retrieved_pricebook_entry.UnitPrice, unit_price)
         finally:
             retrieved_pricebook_entry.delete()
             product.delete()
+
+    def test_zero_decimal_places(self):
+        """Test that DecimalField with decimal_places=0 is correctly parsed"""
+        campaign = Campaign(name='test something', number_sent=3)
+        campaign.save()
+        try:
+            ret = Campaign.objects.filter(number_sent=3)
+            # should be parsed without ".0"
+            val = ret[0].number_sent
+            self.assertEqual(repr(val), "Decimal('3')")
+            self.assertEqual(str(val), "3")
+        finally:
+            campaign.delete()
 
     def test_simple_custom_object(self):
         """Create, read and delete a simple custom object `django_Test__c`.
         """
         from salesforce.testrunner.example.models import Attachment, Test
-        if not 'django_Test__c' in sf_tables():
+        if 'django_Test__c' not in sf_tables():
             self.skipTest("Not found custom object 'django_Test__c'")
         results = Test.objects.all()[0:1]
         obj = Test(test_text='sf_test')
@@ -383,7 +432,7 @@ class BasicSOQLRoTest(TestCase):
             self.skipTest("No object with milisecond resolution found.")
         self.assertTrue(isinstance(triggers[0].PreviousFireTime, datetime.datetime))
         # The reliability of this is only 99.9%, therefore it is commented out.
-        #self.assertNotEqual(trigger.PreviousFireTime.microsecond, 0)
+        # self.assertNotEqual(trigger.PreviousFireTime.microsecond, 0)
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     def test_time_field(self):
@@ -405,7 +454,7 @@ class BasicSOQLRoTest(TestCase):
         """
         if settings.PERSON_ACCOUNT_ACTIVATED:
             test_account = Account(FirstName='IntegrationTest',
-                    LastName='Account')
+                                   LastName='Account')
         else:
             test_account = Account(Name='IntegrationTest Account')
         test_account.save()
@@ -430,48 +479,80 @@ class BasicSOQLRoTest(TestCase):
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     def test_bulk_create(self):
-        """Create two Contacts by one request in one command and find them.
+        """Create two Contacts by one request in one command, find them.
         """
         account = Account(Name='test bulk')
         account.save()
         try:
             objects = [Contact(last_name='sf_test a', account=account),
                        Contact(last_name='sf_test b', account=account)]
-            request_count_0 = salesforce.backend.driver.request_count
 
-            ret = Contact.objects.bulk_create(objects)
-            if DJANGO_110_PLUS:
+            with self.lazy_assert_n_requests(1):
+                ret = Contact.objects.bulk_create(objects)
                 # test that can return ids from bulk_create
                 self.assertEqual(len(set(x.pk for x in ret if x.pk)), 2)
 
-            request_count_1 = salesforce.backend.driver.request_count
-            self.assertEqual(request_count_1,  request_count_0 + 1)
             self.assertEqual(len(Contact.objects.filter(account=account)), 2)
+            self.lazy_check()
         finally:
             account.delete()
-    
-    test_bulk_create_no_soap = no_soap_decorator(test_bulk_create)
 
-    @expectedFailureIf(QUIET_KNOWN_BUGS and DJANGO_111_PLUS)
+    @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     def test_bulk_update(self):
-        """Create two Contacts by one request in one command, find them.
+        """Update two Accounts by one request, after searching them by one request.
         """
         account_0, account_1 = [Account(Name='test' + uid), Account(Name='test' + uid)]
         account_0.save()
         account_1.save()
         try:
-            request_count_0 = salesforce.backend.driver.request_count
-            Account.objects.filter(pk=account_0.pk).update(Name="test2" + uid)
-            Account.objects.filter(pk__in=[account_1.pk]).update(Name="test2" + uid)
-            Account.objects.filter(pk__in=Account.objects.filter(Name='test2' + uid)).update(Name="test3" + uid)
-            request_count_1 = salesforce.backend.driver.request_count
+            # 2x update with different filters by primary key: 1 request per update
+            with self.lazy_assert_n_requests(1):
+                Account.objects.filter(pk=account_0.pk).update(Name="test2" + uid)
+            with self.lazy_assert_n_requests(1):
+                Account.objects.filter(pk__in=[account_1.pk]).update(Name="test2" + uid)
+
+            # 1x update of 2 records + 1 more complicated filter == 2 requests
+            with self.lazy_assert_n_requests(2):
+                Account.objects.filter(pk__in=Account.objects.filter(Name='test2' + uid)).update(Name="test3" + uid)
             self.assertEqual(Account.objects.filter(Name='test3' + uid).count(), 2)
-            self.assertEqual(request_count_1,  request_count_0 + 4)
+            self.lazy_check()
         finally:
             account_0.delete()
             account_1.delete()
 
-    test_bulk_update_no_soap = no_soap_decorator(test_bulk_update)
+    @skipUnless(default_is_sf, "Default database should be any Salesforce.")
+    def test_bulk_delete_and_all(self):
+        """Delete two Accounts one request.
+        """
+        account_0, account_1 = [Account(Name='test' + uid), Account(Name='test' + uid)]
+        account_0.save()
+        account_1.save()
+        try:
+            result_count = 2
+            with self.lazy_assert_n_requests(2):
+                ret = Account.objects.filter(Name='test' + uid).delete()
+            self.assertEqual(ret, (2, {'example.Account': 2}))
+            result_count = Account.objects.filter(Name='test' + uid).count()
+            self.assertEqual(result_count, 0)
+            self.lazy_check()
+        finally:
+            if result_count:
+                account_0.delete()
+                account_1.delete()
+        try:
+            nn = 200
+            pks = []
+            objects = [Lead(Company='sf_test lead', LastName='name_{}'.format(i))
+                       for i in range(nn)]
+            with self.lazy_assert_n_requests(1):
+                ret = Lead.objects.bulk_create(objects)
+            pks = [x.pk for x in objects if x.pk]
+            with self.lazy_assert_n_requests(1):
+                ret = Lead.objects.filter(pk__in=pks).update(Company='sf_test lead_2')
+        finally:
+            if pks:
+                with self.lazy_assert_n_requests(1):
+                    ret = Lead.objects.filter(pk__in=pks).delete()
 
     def test_escape_single_quote(self):
         """Test single quotes in strings used in a filter
@@ -585,13 +666,15 @@ class BasicSOQLRoTest(TestCase):
         test_product2.save()
         pricebook = Pricebook.objects.get(Name="Standard Price Book")
         PricebookEntry(Product2=test_product, Pricebook2=pricebook,
-                UseStandardPrice=False, UnitPrice=Decimal(100)).save()
+                       UseStandardPrice=False, UnitPrice=Decimal(100)).save()
         PricebookEntry(Product2=test_product2, Pricebook2=pricebook,
-                UseStandardPrice=False, UnitPrice=Decimal(80)).save()
+                       UseStandardPrice=False, UnitPrice=Decimal(80)).save()
         try:
             x_products = PricebookEntry.objects.filter(Name__startswith='test ')
-            result = x_products.aggregate(Sum('UnitPrice'), Count('UnitPrice'), Avg('UnitPrice'), Min('UnitPrice'))
-            self.assertDictEqual(result, {'UnitPrice__sum': 180, 'UnitPrice__count': 2, 'UnitPrice__avg': 90.0, 'UnitPrice__min': 80})
+            result = x_products.aggregate(Sum('UnitPrice'), Count('UnitPrice'), Avg('UnitPrice'),
+                                          Min('UnitPrice'), Max('UnitPrice'))
+            self.assertDictEqual(result, {'UnitPrice__sum': 180, 'UnitPrice__count': 2, 'UnitPrice__avg': 90.0,
+                                          'UnitPrice__min': 80, 'UnitPrice__max': 100})
         finally:
             # dependent PricebookEntries are just deleted automatically by SF
             test_product.delete()
@@ -601,16 +684,24 @@ class BasicSOQLRoTest(TestCase):
     def test_z_big_query(self):
         """Test a big query that will be splitted to more requests.
 
-        Test it as late as possible when
+        Test it as late as possible.
         """
-        all_leads = Lead.objects.query_all()
-        leads_list = list(all_leads)
-        if all_leads.query.first_chunk_len == len(leads_list):
+        cur = connections[sf_alias].cursor()
+        cursor = cur.cursor
+        cursor.execute("SELECT Id, Name FROM Lead", query_all=True)
+        first_lead = cursor.fetchone()
+        if first_lead:
+            first_chunk_len = len(cursor._chunk)
+            leads_list = [first_lead] + cursor.fetchall()
+        else:
+            first_chunk_len = 0
+            leads_list = []
+        if first_chunk_len == len(leads_list):
             self.assertLessEqual(len(leads_list), 2000, "Obsoleted constants")
             log.info("Not enough Leads accumulated (currently %d including deleted) "
-                    "in the last two weeks that are necessary for splitting the "
-                    "query into more requests. Number 1001 or 2001 is enough.",
-                    len(leads_list))
+                     "in the last two weeks that are necessary for splitting the "
+                     "query into more requests. Number 2001 is enough.",
+                     len(leads_list))
             self.skipTest("Not enough Leads found for big query test")
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
@@ -623,7 +714,7 @@ class BasicSOQLRoTest(TestCase):
         cursor.execute(sql)
         contacts = cursor.fetchall()
         self.assertEqual(len(contacts), 2)
-        self.assertIn('OwnerId', contacts[0])
+        self.assertTrue(contacts[0][3].startswith('005'), "OwnerId must be an User.")
         cursor.execute(sql)
         self.assertEqual(cursor.fetchone(), contacts[0])
         self.assertEqual(cursor.fetchmany(), contacts[1:])
@@ -637,8 +728,9 @@ class BasicSOQLRoTest(TestCase):
         cursor = connections[sf_alias].cursor()
         cursor.execute(sql)
         contact_aggregate = cursor.fetchone()
-        self.assertTrue('LastName' in contact_aggregate)
-        self.assertGreaterEqual(contact_aggregate['expr0'], 1)
+        self.assertEqual([x[0] for x in cursor.description], ['LastName', 'expr0'])
+        self.assertEqual([type(x) for x in contact_aggregate], [text_type, int])
+        self.assertGreaterEqual(contact_aggregate[1], 1)
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     def test_errors(self):
@@ -646,15 +738,13 @@ class BasicSOQLRoTest(TestCase):
         """
         # broken query raises exception
         bad_queryset = Lead.objects.raw("select XYZ from Lead")
-        bad_queryset.query.debug_silent = True
-        self.assertRaises(salesforce.backend.base.SalesforceError, list, bad_queryset)
+        with QuietSalesforceErrors(sf_alias):
+            self.assertRaises(salesforce.backend.base.SalesforceError, list, bad_queryset)
 
-    @expectedFailureIf(QUIET_KNOWN_BUGS)
     def test_queryset_values(self):
         """Test list of dict qs.values() and list of tuples qs.values_list()
         """
         tmp = Contact.objects.values('pk', 'last_name')
-        # import pdb; pdb.set_trace()
         tmp[0]
         values = Contact.objects.values()[:2]
         self.assertEqual(len(values), 2)
@@ -672,7 +762,8 @@ class BasicSOQLRoTest(TestCase):
         values_list = Contact.objects.values_list('pk', 'first_name', 'last_name')[:2]
         self.assertEqual(len(values_list), 2)
         v0 = values[0]
-        self.assertEqual(values_list[0], (v0['pk'], v0['first_name'], v0['last_name']))
+        # it is a list in Django 2.1, but a tuple in Django 2.0
+        self.assertEqual(list(values_list[0]), [v0['pk'], v0['first_name'], v0['last_name']])
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     def test_double_delete(self):
@@ -681,21 +772,30 @@ class BasicSOQLRoTest(TestCase):
         the same way like "DELETE FROM Contact WHERE Id='deleted yet'" would do.
         """
         contact = Contact(last_name='sf_test',
-                owner=User.objects.get(Username=current_user))
+                          owner=User.objects.get(Username=current_user))
         contact.save()
         contact_id = contact.pk
         Contact(pk=contact_id).delete()
+
         # Id of a deleted object or a too small valid Id shouldn't raise
-        Contact(pk=contact_id).delete()
+        with warnings.catch_warnings(record=True) as w:
+            Contact(pk=contact_id).delete()
+            self.assertIs(w[-1].category, SalesforceWarning)
+            self.assertIn('ENTITY_IS_DELETED', str(w[-1].message))
+        if not PY3:
+            return skip("Python 2.7 doesn't support assertWarns")
         # Simulate the same with obsoleted oauth session
         # It is not possible to use salesforce.auth.expire_token() to simulate
         # expiration because it forces reauhentication before the next request
         salesforce.auth.oauth_data[sf_alias]['access_token'] = 'something invalid/expired'
-        Contact(pk=contact_id).delete()
-        # Id of completely deleted item or fake but valid item.
-        Contact(pk='003000000000000AAA').delete()
-        #bad_id = '003000000000000AAB' # Id with an incorrect uppercase mask
-        #self.assertRaises(salesforce.backend.base.SalesforceError, Contact(pk=bad_id).delete)
+        with self.assertWarns(SalesforceWarning) as cm:
+            Contact(pk=contact_id).delete()
+            self.assertIn('ENTITY_IS_DELETED', cm.warnings[0].message.args[0])
+        with self.assertWarns(SalesforceWarning) as cm:
+            # Id of completely deleted item or fake but valid item.
+            Contact(pk='003000000000000AAA').delete()
+        # bad_id = '003000000000000AAB' # Id with an incorrect uppercase mask
+        # self.assertRaises(salesforce.backend.base.SalesforceError, Contact(pk=bad_id).delete)
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     @skipUnless(len(sf_databases) > 1, "Only one SF database found.")
@@ -746,80 +846,82 @@ class BasicSOQLRoTest(TestCase):
                 x.delete()
 
     # This should not be implemented due to Django conventions.
-    #def test_raw_aggregate(self):
-    #   # raises "TypeError: list indices must be integers, not str"
-    #   list(Contact.objects.raw("select Count() from Contact"))
+    # def test_raw_aggregate(self):
+    #    # raises "TypeError: list indices must be integers, not str"
+    #    list(Contact.objects.raw("select Count() from Contact"))
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
-    @expectedFailureIf(QUIET_KNOWN_BUGS and DJANGO_110_PLUS)
     def test_only_fields(self):
         """Verify that access to "only" fields doesn't require a request, but others do.
         """
-        def assert_n_requests(n):
-            # verify the necessary number of requests
-            # print("-- req=%d (expect %d)" % (salesforce.backend.driver.request_count - request_count_0, n))
-            self.assertEqual(salesforce.backend.driver.request_count - request_count_0, n)
-
         # print([(x.id, x.last_name) for x in Contact.objects.only('last_name').order_by('id')[:2]])
-        request_count_0 = salesforce.backend.driver.request_count
-        sql = User.objects.only('Username').query.get_compiler('salesforce').as_sql()[0]
-        self.assertEqual(sql, 'SELECT User.Id, User.Username FROM User')
-        assert_n_requests(0)
+        with self.lazy_assert_n_requests(0):
+            sql = User.objects.only('Username').query.get_compiler('salesforce').as_sql()[0]
+            self.assertEqual(sql, 'SELECT User.Id, User.Username FROM User')
 
-        user = User.objects.only('Username').order_by('pk')[0]                  # req
-        assert_n_requests(1)
+        with self.lazy_assert_n_requests(1):
+            user = User.objects.only('Username').order_by('pk')[0]
 
         # Verify that deferred fields work
-        user.pk                                                                 # no request
-        user_username = user.Username
+        with self.lazy_assert_n_requests(0):
+            user.pk
+            user_username = user.Username
         self.assertIn('@', user_username)
-        assert_n_requests(1)
 
-        self.assertGreater(len(user.LastName), 0)                               # req
-        #import pdb; pdb.set_trace()
-        assert_n_requests(2)
+        with self.lazy_assert_n_requests(1):
+            self.assertGreater(len(user.LastName), 0)
 
-        self.assertEqual(user_username, User.objects.get(pk=user.pk).Username)  # req
-        assert_n_requests(3)
+        with self.lazy_assert_n_requests(1):
+            self.assertEqual(user_username, User.objects.get(pk=user.pk).Username)
 
-        xx = Contact.objects.only('last_name').order_by('pk')[0]                # req
-        assert_n_requests(4)
+        with self.lazy_assert_n_requests(1):
+            xx = Contact.objects.only('last_name').order_by('pk')[0]
 
-        xx.last_name                                                            # no req
-        # print((xx.id, xx.last_name))
-        assert_n_requests(4)
+        with self.lazy_assert_n_requests(0):
+            xx.last_name
 
-        xy = Contact.objects.only('account').order_by('pk')[1]                  # req
-        assert_n_requests(5)
+        with self.lazy_assert_n_requests(1):
+            xy = Contact.objects.only('account').order_by('pk')[1]
 
-        xy.account_id                                                           # no req
-        assert_n_requests(5)
+        with self.lazy_assert_n_requests(0):
+            xy.account_id
 
-        # print((xy.id, xy.last_name))                                          # req
-        #import pdb; pdb.set_trace()
-        self.assertGreater(len(xy.last_name), 0)
-        assert_n_requests(6)
+        with self.lazy_assert_n_requests(1):
+            self.assertGreater(len(xy.last_name), 0)
 
-        xy.last_name                                                            # no req
-        assert_n_requests(6)                                                    # total 6 requests
+        with self.lazy_assert_n_requests(0):
+            xy.last_name
+
+        self.lazy_check()
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
-    @expectedFailureIf(QUIET_KNOWN_BUGS and DJANGO_110_PLUS)
     def test_defer_fields(self):
         """Verify that access to a deferred field requires a new request, but others don't.
         """
-        request_count_0 = salesforce.backend.driver.request_count
-        contact = Contact.objects.defer('email')[0]
-        self.assertEqual(salesforce.backend.driver.request_count, request_count_0 + 1)
-        _ = contact.last_name
-        self.assertEqual(salesforce.backend.driver.request_count, request_count_0 + 1)
-        _ = contact.email
-        self.assertEqual(salesforce.backend.driver.request_count, request_count_0 + 2)
+        with self.lazy_assert_n_requests(1):
+            contact = Contact.objects.defer('email')[0]
+        with self.lazy_assert_n_requests(0):
+            _ = contact.last_name
+        with self.lazy_assert_n_requests(1):
+            _ = contact.email
+        self.lazy_check()
+        _  # NOQA
 
-    @expectedFailureIf(QUIET_KNOWN_BUGS and DJANGO_110_PLUS)
     def test_incomplete_raw(self):
-        last_name = Contact.objects.raw("select id from Contact")[0].last_name
-        self.assertGreater(len(last_name), 0)
+        """Test that omitted model fields can be queried by dot."""
+        # with self.lazy_assert_n_requests(2):  # problem - Why too much requests?
+        # raw query must contain the primary key (with the right capitalization, currently)
+        with self.lazy_assert_n_requests(1):  # TODO why two requests?
+            ret = list(Contact.objects.raw("select Id from Contact"))
+        with self.lazy_assert_n_requests(1):
+            last_name = ret[0].last_name
+        self.assertTrue(last_name and 'last' not in last_name.lower())
+        with self.lazy_assert_n_requests(1):
+            first_name = ret[0].first_name
+        with self.lazy_assert_n_requests(0):
+            last_name = ret[0].last_name
+        assert first_name
+        self.lazy_check()
 
     @skipUnless(default_is_sf, "Default database should be any Salesforce.")
     def test_filter_by_more_fk_to_the_same_model(self):
@@ -831,8 +933,8 @@ class BasicSOQLRoTest(TestCase):
         test_lead.save()
         try:
             qs = Lead.objects.filter(pk=test_lead.pk,
-                    owner__Username=current_user,
-                    last_modified_by__Username=current_user)
+                                     owner__Username=current_user,
+                                     last_modified_by__Username=current_user)
             # Verify that a coplicated analysis is not performed on old Django
             # so that the query can be at least somehow simply compiled to SOQL
             # without exceptions, in order to prevent regressions.
@@ -857,11 +959,14 @@ class BasicSOQLRoTest(TestCase):
         test_task = Task(who=test_lead)
         test_task.save()
         try:
-            qs = Task.objects.filter(who__in=Lead.objects.filter(pk=test_lead.pk,
+            qs = Task.objects.filter(
+                who__in=Lead.objects.filter(
+                    pk=test_lead.pk,
                     owner__Username=current_user,
-                    last_modified_by__Username=current_user))
+                    last_modified_by__Username=current_user)
+            )
             sql, params = qs.query.get_compiler('salesforce').as_sql()
-            self.assertRegexpMatches(sql, 'SELECT Task.Id, .* FROM Task WHERE Task.WhoId IN \(SELECT ')
+            self.assertRegexpMatches(sql, r'SELECT Task.Id, .* FROM Task WHERE Task.WhoId IN \(SELECT ')
             self.assertIn('Lead.Owner.Username = %s', sql)
             self.assertIn('Lead.LastModifiedBy.Username = %s', sql)
             refreshed_lead = qs[:1]
@@ -885,8 +990,9 @@ class BasicSOQLRoTest(TestCase):
         try:
             qs = contact.opportunities.all()
             sql, params = qs.query.get_compiler('salesforce').as_sql()
-            self.assertRegexpMatches(sql, 'SELECT .*OpportunityContactRole\.Opportunity\.StageName.* '
-                    'FROM OpportunityContactRole WHERE OpportunityContactRole.ContactId =')
+            self.assertRegexpMatches(sql,
+                                     r'SELECT .*OpportunityContactRole\.Opportunity\.StageName.* '
+                                     'FROM OpportunityContactRole WHERE OpportunityContactRole.ContactId =')
             self.assertEqual([x.pk for x in qs], 2 * [oppo.pk])
         finally:
             oc2.delete()
@@ -899,7 +1005,7 @@ class BasicSOQLRoTest(TestCase):
         are correctly compiled. (__r, __c etc.)
         """
         from salesforce.testrunner.example.models import Attachment, Test
-        if not 'django_Test__c' in sf_tables():
+        if 'django_Test__c' not in sf_tables():
             self.skipTest("Not found custom object 'django_Test__c'")
         qs = Attachment.objects.filter(parent__name='abc')
         # "SELECT Attachment.Id FROM Attachment WHERE Attachment.Parent.Name = 'abc'"
@@ -914,10 +1020,10 @@ class BasicSOQLRoTest(TestCase):
         alias = getattr(settings, 'SALESFORCE_DB_ALIAS', 'salesforce')
         self.assertEqual(Contact.objects.using(None)._db, alias)
 
-    @skipUnless(hasattr(models_template, 'Organization'), "Skipped because models_template.Organization doesn't exist")
     def test_dynamic_fields(self):
         """Test that fields can be copied dynamically from other model"""
-        self.assertGreater(Organization.objects.get().created_by.Username, '')
+        self.assertTrue(models_template)
+        self.assertIn('@', Organization.objects.get().created_by.Username)
 
 # ============= Tests that need setUp Lead ==================
 
@@ -959,17 +1065,17 @@ class BasicLeadSOQLTest(TestCase):
                 obj.delete()
         self.objs = []
 
-
     def test_exclude_query_construction(self):
         """Test that exclude query construction returns valid SOQL.
         """
-        contacts = Contact.objects.filter(first_name__isnull=False
-                ).exclude(email="steve@apple.com", last_name="Wozniak").exclude(last_name="smith")
+        contacts = (Contact.objects.filter(first_name__isnull=False)
+                    .exclude(email="steve@apple.com", last_name="Wozniak")
+                    .exclude(last_name="smith"))
         number_of_contacts = contacts.count()
         self.assertIsInstance(number_of_contacts, int)
         # the default self.test_lead shouldn't be excluded by only one nondition
-        leads = Lead.objects.exclude(Email="steve@apple.com", LastName="Unittest General"
-                ).filter(FirstName="User" + uid, LastName="Unittest General")
+        leads = (Lead.objects.exclude(Email="steve@apple.com", LastName="Unittest General")
+                 .filter(FirstName="User" + uid, LastName="Unittest General"))
         self.assertEqual(leads.count(), 1)
 
     def test_get(self):
@@ -1049,3 +1155,14 @@ class BasicLeadSOQLTest(TestCase):
             note_1.delete()
             note_2.delete()
             test_contact.delete()
+
+
+def clean_test_data():
+    """Clean test objects after an interrupted test.
+
+    All tests are written so that a failed test should not leave objects,
+    but a test interrupted by debugger or Ctrl-C could do it.
+    """
+    ids = [x for x in Product.objects.filter(Name__startswith='test ')
+           if re.match(r'test [a-z_0-9]+', x.Name)]
+    Product.objects.filter(pk__in=ids).delete()

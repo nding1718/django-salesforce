@@ -1,13 +1,16 @@
 """
 Common helpers for tests, like test decorators
 """
-from unittest import skip, skipUnless, expectedFailure  # NOQA
 import sys
 import uuid
+from unittest import skip, skipUnless, expectedFailure, TestCase  # NOQA pylint:disable=unused-import
 
 import django
 from django.conf import settings
+
 from salesforce import router
+from salesforce.dbapi.test_helpers import (  # NOQA pylint:disable=unused-import
+    LazyTestMixin, expectedFailureIf, QuietSalesforceErrors)
 
 # uid strings for tests that accidentally run concurrent
 uid_random = '-' + str(uuid.uuid4())[:7]
@@ -17,25 +20,3 @@ uid_version = 'py{0}{1}-dj{2}{3}'.format(*(sys.version_info[:2] + django.VERSION
 sf_alias = getattr(settings, 'SALESFORCE_DB_ALIAS', 'salesforce')
 default_is_sf = router.is_sf_database(sf_alias)
 current_user = settings.DATABASES[sf_alias]['USER']
-
-def expectedFailureIf(condition):
-    """Conditional 'expectedFailure' decorator for TestCase"""
-    if condition:
-        return expectedFailure
-    else:
-        return lambda func: func
-
-
-def no_soap_decorator(f):
-    """Decorator to not temporarily use SOAP API (Beatbox)"""
-    from functools import wraps
-    import salesforce.backend.driver
-    @wraps(f)
-    def wrapper(*args, **kwds):
-        beatbox_orig = salesforce.backend.driver.beatbox
-        setattr(salesforce.backend.driver, 'beatbox', None)
-        try:
-            return f(*args, **kwds)
-        finally:
-            setattr(salesforce.backend.driver, 'beatbox', beatbox_orig)
-    return wrapper
